@@ -1,5 +1,5 @@
 '''
-@author Michael Bommarito; http://bommaritollc.com/
+@author Michael Bommarito: Bommarito Consulting, LLC; http://bommaritollc.com/
 @date 20130211
 
 This fabfile manages the deployment of an Oracle database instance:
@@ -15,13 +15,6 @@ giving away the cow, just some milk.
 If you're interested in a deployment like this, please contact me at:
     michael@bommaritollc.com
     http://bommaritollc.com/
-
-Sample runs:
-    Start @ 3:04, End @ 
-    
-     
-    
-    
 '''
 
 # Standard imports
