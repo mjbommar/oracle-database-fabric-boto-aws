@@ -2,13 +2,33 @@
 @author Michael Bommarito; http://bommaritollc.com/
 @date 20130211
 
-This fabfile manages the deployment of an Oracle database instance.
+This fabfile manages the deployment of an Oracle database instance:
+    * single instance; no RON/RAC
+    * no ASM
+    * no LVM/RAID configuration for ephemeral or EBS
+    * single host management; config does not support tracking multiple hosts
+    * very little template configuration 
+
+This is all done with minimal exception handling and AWS magic; sorry, not
+giving away the cow, just some milk.
+
+If you're interested in a deployment like this, please contact me at:
+    michael@bommaritollc.com
+    http://bommaritollc.com/
+
+Sample runs:
+    Start @ 3:04, End @ 
+    
+     
+    
+    
 '''
 
 # Standard imports
 import csv
 import datetime
 import os.path
+import re
 import sys
 import time
 
@@ -16,15 +36,14 @@ import time
 from fabric.api import run, sudo, settings, env, cd, put, execute
 from fabric.colors import red, green, yellow
 from fabric.contrib.files import exists, upload_template
-from fabric.operations import reboot, prompt
+from fabric.operations import reboot, prompt, get
 from fabtools.system import get_sysctl, set_sysctl
 
 # Boto imports
 from boto.ec2.connection import EC2Connection
 from boto.exception import EC2ResponseError
-from boto.ec2.securitygroup import SecurityGroup
-import boto.ec2.blockdevicemapping
 from boto.ec2.blockdevicemapping import EBSBlockDeviceType, BlockDeviceMapping
+from StringIO import StringIO
 
 '''
 Fabric configuration for executing host.
@@ -62,6 +81,8 @@ security_group_name = "oracle-database"
 
 # Oracle configuration
 oracle_installer_uri = "https://s3.amazonaws.com/bommarito-consulting/app/oracle/oracle-database-11.2.0.3.tar.gz"
+oracle_tmp_pattern = re.compile('/tmp/([a-zA-Z0-9_\-]+)\.', re.IGNORECASE)
+oracle_log_pattern = re.compile('/u01/app/oraInventory/logs/.+')
 
 '''
 Fabric helper methods for command line usage.
@@ -100,8 +121,7 @@ def update_host():
     '''
     Update the fabric host environment variable based on hosts.txt
     '''
-    if not env.host_string:
-        env.host_string = get_host()   
+    env.host_string = get_host()   
 
 '''
 Fabric methods for deployment/configuration defined below.
@@ -116,7 +136,7 @@ def yum_update():
     if update_ret.failed:
         raise RuntimeError("Unable to update yum repository information.")
 
-def yum_install(package_list=[], update_cache=True):
+def yum_install(package_list=[], update_cache=False):
     '''
     Install required yum packages.
     '''
@@ -146,19 +166,20 @@ def yum_install(package_list=[], update_cache=True):
     if yum_ret.failed:
         raise RuntimeError("Unable to install package {}.".format(package))
 
-def yum_upgrade():
+def yum_upgrade(update_cache=False):
     '''
     Upgrade all installed yum packages.
     '''
     # Update repo cache
-    yum_update()
+    if update_cache:
+        yum_update()
     
     # Complete pending transactions if not clean.
     pending_ret = run_quiet('yum-complete-transaction -y', use_sudo=True)
     pending_ret = run_quiet('package-cleanup --problems', use_sudo=True)
     
     # Upgrade packages
-    upgrade_ret = run_quiet('yum -y --skip-broken update', use_sudo=True)
+    upgrade_ret = run_quiet('yum -y --skip-broken upgrade', use_sudo=True)
     if upgrade_ret.failed:
         raise RuntimeError("Unable to upgrade yum packages.")
 
@@ -200,7 +221,7 @@ def resize_root():
     '''
     run_quiet('resize2fs /dev/sda1')
 
-def setup_oracle_keys():
+def setup_oracle_user():
     '''
     Setup the Oracle user keys.
     '''
@@ -210,6 +231,22 @@ def setup_oracle_keys():
     run_quiet('chown -R oracle:oinstall /home/oracle/.ssh/', use_sudo=True)
     run_quiet('chmod -R 700 /home/oracle/.ssh/')
     run_quiet('chmod 600 /home/oracle/.ssh/authorized_keys', use_sudo=True)
+    
+    # Setup bash_profile
+    run_quiet("echo ORACLE_HOME=/u01/app/oracle/product/11.2.0/dbhome_1 >> /home/oracle/.bash_profile")
+    run_quiet("echo ORACLE_BASE=/u01/app/oracle >> /home/oracle/.bash_profile")
+    run_quiet("echo ORACLE_SID=oracle >> /home/oracle/.bash_profile")
+    run_quiet("echo ORACLE_UNQNAME=oracle >> /home/oracle/.bash_profile")
+    run_quiet("echo 'PATH=$PATH:$ORACLE_HOME/bin/' >> /home/oracle/.bash_profile")
+    run_quiet("echo export ORACLE_HOME ORACLE_BASE ORACLE_SID ORACLE_UNQNAME PATH >> /home/oracle/.bash_profile")
+
+def disable_software_firewall():
+    '''
+    Disable iptables software firewall; sometimes useful for QoS/routing,
+    but easier in this example and basic whitelisting done at hardware level.
+    '''
+    run_quiet('chkconfig iptables off', use_sudo=True)
+    run_quiet('service iptables stop', use_sudo=True)
 
 def setup_db_reqs():
     '''
@@ -219,10 +256,11 @@ def setup_db_reqs():
     Most are handled by oracle-validated package.
     '''
     # Get our keys into oracle user.
-    setup_oracle_keys()
+    setup_oracle_user()
     
     # Setup OFA paths and download installer.
     run_quiet('mkdir -p /u01/install', use_sudo=True)
+    run_quiet('groupadd oper', use_sudo=True)
     
     # Download Oracle installer.
     with cd('/u01/install/'):
@@ -236,6 +274,122 @@ def setup_db_reqs():
     run_quiet('chown -R oracle:oinstall /u01', use_sudo=True)
     run_quiet('chmod -R 775 /u01', use_sudo=True)   
     
+def install_db():
+    '''
+    Upload the response file template and run the Oracle installer.
+    '''
+   
+    '''
+    Upload response file to Oracle home.
+    We need to get some contextual information from the host.
+    '''
+    hostname = run('hostname')
+    TEMPLATE_CONTEXT = {'ORACLE_HOSTNAME': hostname}
+    upload_template("database.rsp_template", "/home/oracle/database.rsp", 
+                    template_dir=TEMPLATE_DIR, use_jinja=True, 
+                    context=TEMPLATE_CONTEXT)
+    
+    # OK, run the installer from response file now.
+    with cd('/u01/install/database/'):
+        # Clear old nohup and launch.
+        run_quiet('rm -f ./nohup.out')
+        output = run_quiet('nohup ./runInstaller -responseFile /home/oracle/database.rsp -ignoreSysPrereqs -ignorePrereq -silent')
+        
+        # Wait until log is available in oraInventory; sloppy hack timing.
+        oracle_log_buffer = None
+        oracle_log = None
+        
+        for i in range(6):
+            # Update buffer
+            get('nohup.out', local_path="./nohup.out")
+            oracle_log_buffer = open('nohup.out', 'r').read()
+            oracle_log_match = oracle_log_pattern.findall(oracle_log_buffer)
+            if len(oracle_log_match) > 0:
+                oracle_log = oracle_log_match.pop()
+                break
+            else:
+                time.sleep(5)
+        
+        if not oracle_log:
+            print(red("Unable to detect log match in nohup."))
+        
+        # Tail the log until we see that the install is complete.
+        oracle_log_buffer = None
+        
+        while True:
+            # Update local copy.
+            # Update buffer
+            get(oracle_log, local_path="./oracle_log.txt")
+            oracle_log_buffer = open('./oracle_log.txt', 'r').read()
+            
+            if 'INFO: Unloading Setup Driver' in oracle_log_buffer:
+                print(green("Installation complete."))
+                break
+            else:
+                print(yellow("Tailing Oracle log file:"))
+                run_quiet('tail {}'.format(oracle_log))
+                
+            # OK, wait a few.
+            time.sleep(10)
+                
+def install_db_post():
+    '''
+    Run post-installation steps as root.
+    '''
+    # Execute root scripts
+    run_quiet('/u01/app/oraInventory/orainstRoot.sh', use_sudo=True)
+    run_quiet('/u01/app/oracle/product/11.2.0/dbhome_1/root.sh', use_sudo=True)
+
+def create_listener():
+    '''
+    Run netca with a response file to create a listener.
+    '''
+    # Upload netca template
+    upload_template("netca.rsp_template", "/home/oracle/netca.rsp", 
+                    template_dir=TEMPLATE_DIR, use_jinja=True)
+    
+    # Run netca
+    run_quiet('netca -silent -responseFile /home/oracle/netca.rsp')
+
+def create_database():
+    '''
+    Run dbca with a response file to create a database.
+    '''
+    # Upload netca template
+    upload_template("dbca.rsp_template", "/home/oracle/dbca.rsp", 
+                    template_dir=TEMPLATE_DIR, use_jinja=True)
+    
+    # Run netca
+    run_quiet('dbca -silent -responseFile /home/oracle/dbca.rsp')
+    
+def post_launch(host_string, host_string_oracle):
+    '''
+    Run post-launch steps.
+    '''
+    # Resize root EBS volume for older RHEL instance.
+    execute(resize_root, hosts=[host_string])
+
+    # Disable software firewall
+    execute(disable_software_firewall, hosts=[host_string])
+    
+    # Update and reboot host.
+    execute(yum_upgrade_reboot, hosts=[host_string])
+    
+    # Enroll in OEL yum repo
+    execute(enroll_oel, hosts=[host_string])
+    execute(yum_install, hosts=[host_string])
+    
+    # Setup DB/OFA requirements, e.g., oracle user, /u01/
+    execute(setup_db_reqs, hosts=[host_string])
+    
+    # Now install the DB software and run post-installation.
+    execute(install_db, hosts=[host_string_oracle])
+    execute(install_db_post, hosts=[host_string])
+    
+    # Now create a listener and database with dbca/netca.
+    execute(create_listener, hosts=[host_string_oracle])
+    execute(create_database, hosts=[host_string_oracle])
+
 def launch_instance():
     '''
     Launch an Oracle database instance.
@@ -314,16 +468,12 @@ def launch_instance():
     host_string_oracle = "{}@{}".format("oracle", instance.public_dns_name)
     set_host(host_string)
 
-    # Execute updates
-    execute(yum_upgrade_reboot, hosts=[host_string])
-    
-    # Enroll in OEL yum repo
-    execute(enroll_oel, hosts=[host_string])
-    execute(yum_install, hosts=[host_string])
-    
-    # Setup DB/OFA requirements, e.g., oracle user, /u01/
-    execute(setup_db_reqs, hosts=[host_string])
+    # Run post-launch steps.
+    post_launch(host_string, host_string_oracle)
 
 # Create EC2 connection
 ec2_connection = EC2Connection(aws_access_key_id=AWS_ACCESS_KEY, aws_secret_access_key=AWS_SECRET_KEY)
-update_host()
+
+# If no -H argument was specified, update host from config file.
+if not env.host_string:
+    update_host()

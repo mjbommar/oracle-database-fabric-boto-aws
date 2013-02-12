@@ -79,7 +79,7 @@ enabled=0
 name=Oracle Linux $releasever Update 9 installation media copy ($basearch)
 baseurl=http://public-yum.oracle.com/repo/OracleLinux/OL5/9/base/$basearch/
 gpgkey=http://public-yum.oracle.com/RPM-GPG-KEY-oracle-el5
-gpgcheck=0
+gpgcheck=1
 enabled=1
 
 [el5_addons]
