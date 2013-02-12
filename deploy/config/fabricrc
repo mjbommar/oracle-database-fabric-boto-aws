@@ -1,2 +1,2 @@
 user = root
-key_filename = ec2.pem
+key_filename = ec2-keypair.pem

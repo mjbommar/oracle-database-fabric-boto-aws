@@ -5,5 +5,9 @@ aws-credentials.txt
 .project
 .pydevproject
 
+#Saves
+*#
+*~
+
 # Pyc's
 *.pyc
