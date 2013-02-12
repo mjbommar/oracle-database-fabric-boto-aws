@@ -1,0 +1,2 @@
+user = root
+key_filename = ec2.pem
