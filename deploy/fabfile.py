@@ -362,7 +362,7 @@ def create_database():
     # Run netca
     run_quiet('dbca -silent -responseFile /home/oracle/dbca.rsp')
     
-def post_launch(host_string, host_string_oracle):
+def post_launch(host_string, host_string_oracle, skip_updates=False):
     '''
     Run post-launch steps.
     '''
@@ -373,7 +373,8 @@ def post_launch(host_string, host_string_oracle):
     execute(disable_software_firewall, hosts=[host_string])
     
     # Update and reboot host.
-    execute(yum_upgrade_reboot, hosts=[host_string])
+    if not skip_updates:
+        execute(yum_upgrade_reboot, hosts=[host_string])
     
     # Enroll in OEL yum repo
     execute(enroll_oel, hosts=[host_string])
@@ -390,12 +391,24 @@ def post_launch(host_string, host_string_oracle):
     execute(create_listener, hosts=[host_string_oracle])
     execute(create_database, hosts=[host_string_oracle])
 
-def launch_instance():
+def launch_instance(skip_updates=False):
     '''
     Launch an Oracle database instance.
     '''
     # Assume the keypair name is based on our env.key_filename.
     instance_key_name = os.path.basename(env.key_filename).replace('.pem', '')
+    
+    # Check that we have a security group configured already.
+    security_group_list = ec2_connection.get_all_security_groups()
+    security_group_found = False
+    for security_group in security_group_list:
+        if security_group.name == security_group_name:
+            security_group_found = True
+            break
+    
+    # If we didn't find it, create it.
+    if not security_group_found:
+        create_security_group()    
     
     # We want a larger EBS root volume, so override /dev/sda1.
     # Create an EBS device with 40GB allocated.
@@ -469,7 +482,7 @@ def launch_instance():
     set_host(host_string)
 
     # Run post-launch steps.
-    post_launch(host_string, host_string_oracle)
+    post_launch(host_string, host_string_oracle, skip_updates=skip_updates)
 
 # Create EC2 connection
 ec2_connection = EC2Connection(aws_access_key_id=AWS_ACCESS_KEY, aws_secret_access_key=AWS_SECRET_KEY)
