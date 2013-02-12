@@ -1,0 +1,9 @@
+# AWS credentials
+aws-credentials.txt
+
+# Eclipse
+.project
+.pydevproject
+
+# Pyc's
+*.pyc
